@@ -58,12 +58,13 @@ public class HadoopReadOptions extends ParquetReadOptions {
                             ByteBufferAllocator allocator,
                             int maxAllocationSize,
                             Map<String, String> properties,
+                            int inputStreamPoolSize,
                             Configuration conf,
                             FileDecryptionProperties fileDecryptionProperties) {
     super(
         useSignedStringMinMax, useStatsFilter, useDictionaryFilter, useRecordFilter, useColumnIndexFilter,
         usePageChecksumVerification, useBloomFilter, recordFilter, metadataFilter, codecFactory, allocator,
-        maxAllocationSize, properties, fileDecryptionProperties
+        maxAllocationSize, properties, inputStreamPoolSize, fileDecryptionProperties
     );
     this.conf = conf;
   }
@@ -120,13 +121,13 @@ public class HadoopReadOptions extends ParquetReadOptions {
     @Override
     public ParquetReadOptions build() {
       if (null == fileDecryptionProperties) {
-        // if not set, check if Hadoop conf defines decryption factory and properties 
+        // if not set, check if Hadoop conf defines decryption factory and properties
         fileDecryptionProperties = createDecryptionProperties(filePath, conf);
       }
       return new HadoopReadOptions(
         useSignedStringMinMax, useStatsFilter, useDictionaryFilter, useRecordFilter,
         useColumnIndexFilter, usePageChecksumVerification, useBloomFilter, recordFilter, metadataFilter,
-        codecFactory, allocator, maxAllocationSize, properties, conf, fileDecryptionProperties);
+        codecFactory, allocator, maxAllocationSize, properties, inputStreamPoolSize, conf, fileDecryptionProperties);
     }
   }
 

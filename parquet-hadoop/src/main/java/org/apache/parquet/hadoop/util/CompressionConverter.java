@@ -250,27 +250,31 @@ public class CompressionConverter {
   public static final class TransParquetFileReader extends ParquetFileReader {
 
     public TransParquetFileReader(InputFile file, ParquetReadOptions options) throws IOException {
-      super(file, options);
+      super(file, ParquetReadOptions.builder().copy(options).withInputStreamPoolSize(1).build());
     }
 
     public void setStreamPosition(long newPos) throws IOException {
-      f.seek(newPos);
+      executeWithInputStream(f -> f.seek(newPos));
     }
 
     public void blockRead(byte[] data, int start, int len) throws IOException {
-      f.readFully(data, start, len);
+      executeWithInputStream(f -> f.readFully(data, start, len));
     }
 
     public PageHeader readPageHeader() throws IOException {
-      return Util.readPageHeader(f);
+      return executeWithInputStreamWithReturn(Util::readPageHeader);
     }
 
     public long getPos() throws IOException {
-      return f.getPos();
+      return executeWithInputStreamWithReturn(SeekableInputStream::getPos);
     }
 
     public SeekableInputStream getStream() {
-      return f;
+      try {
+        return executeWithInputStreamWithReturn(f -> f);
+      } catch (IOException e) {
+        throw new RuntimeException(e);
+      }
     }
   }
 }

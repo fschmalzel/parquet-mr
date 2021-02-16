@@ -51,6 +51,8 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -657,7 +659,7 @@ public class ParquetFileReader implements Closeable {
     return new ParquetFileReader(file, options);
   }
 
-  protected final SeekableInputStream f;
+  private final BlockingQueue<SeekableInputStream> inputStreamPool;
   private final InputFile file;
   private final ParquetReadOptions options;
   private final Map<ColumnPath, ColumnDescriptor> paths = new HashMap<>();
@@ -705,7 +707,6 @@ public class ParquetFileReader implements Closeable {
     this.converter = new ParquetMetadataConverter(configuration);
     this.file = HadoopInputFile.fromPath(filePath, configuration);
     this.fileMetaData = fileMetaData;
-    this.f = file.newStream();
     this.fileDecryptor = fileMetaData.getFileDecryptor();
     if (null == fileDecryptor) {
       this.options = HadoopReadOptions.builder(configuration).build();
@@ -713,6 +714,10 @@ public class ParquetFileReader implements Closeable {
       this.options = HadoopReadOptions.builder(configuration)
                                       .withDecryption(fileDecryptor.getDecryptionProperties())
                                       .build();
+    }
+    this.inputStreamPool = new ArrayBlockingQueue<>(options.getInputStreamPoolSize());
+    for (int i = 0; i < options.getInputStreamPoolSize(); i++) {
+      this.inputStreamPool.add(file.newStream());
     }
     this.blocks = filterRowGroups(blocks);
     this.blockIndexStores = listWithNulls(this.blocks.size());
@@ -747,7 +752,6 @@ public class ParquetFileReader implements Closeable {
   public ParquetFileReader(Configuration conf, Path file, ParquetMetadata footer) throws IOException {
     this.converter = new ParquetMetadataConverter(conf);
     this.file = HadoopInputFile.fromPath(file, conf);
-    this.f = this.file.newStream();
     this.fileMetaData = footer.getFileMetaData();
     this.fileDecryptor = fileMetaData.getFileDecryptor();
     if (null == fileDecryptor) {
@@ -756,6 +760,10 @@ public class ParquetFileReader implements Closeable {
       this.options = HadoopReadOptions.builder(conf)
                                       .withDecryption(fileDecryptor.getDecryptionProperties())
                                       .build();
+    }
+    this.inputStreamPool = new ArrayBlockingQueue<>(options.getInputStreamPoolSize());
+    for (int i = 0; i < options.getInputStreamPoolSize(); i++) {
+      this.inputStreamPool.add(this.file.newStream());
     }
     this.footer = footer;
     this.blocks = filterRowGroups(footer.getBlocks());
@@ -770,15 +778,20 @@ public class ParquetFileReader implements Closeable {
   public ParquetFileReader(InputFile file, ParquetReadOptions options) throws IOException {
     this.converter = new ParquetMetadataConverter(options);
     this.file = file;
-    this.f = file.newStream();
+    SeekableInputStream inputStream = file.newStream();
     this.options = options;
     try {
-      this.footer = readFooter(file, options, f, converter);
+      this.footer = readFooter(file, options, inputStream, converter);
     } catch (Exception e) {
       // In case that reading footer throws an exception in the constructor, the new stream
       // should be closed. Otherwise, there's no way to close this outside.
-      f.close();
+      inputStream.close();
       throw e;
+    }
+    this.inputStreamPool = new ArrayBlockingQueue<>(options.getInputStreamPoolSize());
+    this.inputStreamPool.add(inputStream);
+    for (int i = 1; i < options.getInputStreamPoolSize(); i++) {
+      this.inputStreamPool.add(file.newStream());
     }
     this.fileMetaData = footer.getFileMetaData();
     this.fileDecryptor = fileMetaData.getFileDecryptor(); // must be called before filterRowGroups!
@@ -803,7 +816,7 @@ public class ParquetFileReader implements Closeable {
     if (footer == null) {
       try {
         // don't read the row groups because this.blocks is always set
-        this.footer = readFooter(file, options, f, converter);
+        this.footer = executeWithInputStreamWithReturn(f -> readFooter(file, options, f, converter));
       } catch (IOException e) {
         throw new ParquetDecodingException("Unable to read file footer", e);
       }
@@ -885,7 +898,7 @@ public class ParquetFileReader implements Closeable {
   }
 
   public void appendTo(ParquetFileWriter writer) throws IOException {
-    writer.appendRowGroups(f, blocks, true);
+    executeWithInputStream(f -> writer.appendRowGroups(f, blocks, true));
   }
 
   /**
@@ -945,14 +958,51 @@ public class ParquetFileReader implements Closeable {
     }
     // actually read all the chunks
     ChunkListBuilder builder = new ChunkListBuilder(block.getRowCount());
-    for (ConsecutivePartList consecutiveChunks : allParts) {
-      consecutiveChunks.readAll(f, builder);
-    }
+    executeWithInputStream(f -> {
+      for (ConsecutivePartList consecutiveChunks : allParts) {
+        consecutiveChunks.readAll(f, builder);
+      }
+    });
     for (Chunk chunk : builder.build()) {
       readChunkPages(chunk, block, rowGroup);
     }
 
     return rowGroup;
+  }
+
+  protected interface SeekableInputStreamFunction<T> {
+     T execute(SeekableInputStream stream) throws IOException;
+  }
+
+  protected interface SeekableInputStreamConsumer {
+    void execute(SeekableInputStream stream) throws IOException;
+  }
+
+  protected final <T> T executeWithInputStreamWithReturn(SeekableInputStreamFunction<T> function) throws IOException {
+    SeekableInputStream inputStream = null;
+    try {
+      inputStream = inputStreamPool.take();
+      return function.execute(inputStream);
+    } catch (InterruptedException e) {
+      throw new IOException("Unable to get reader!");
+    } finally {
+      if (inputStream != null) {
+        inputStreamPool.offer(inputStream);
+      }
+    }
+  }
+  protected final void executeWithInputStream(SeekableInputStreamConsumer consumer) throws IOException {
+    SeekableInputStream inputStream = null;
+    try {
+      inputStream = inputStreamPool.take();
+      consumer.execute(inputStream);
+    } catch (InterruptedException e) {
+      throw new IOException("Unable to get reader!");
+    } finally {
+      if (inputStream != null) {
+        inputStreamPool.offer(inputStream);
+      }
+    }
   }
 
   /**
@@ -1018,9 +1068,11 @@ public class ParquetFileReader implements Closeable {
       }
     }
     // actually read all the chunks
-    for (ConsecutivePartList consecutiveChunks : allParts) {
-      consecutiveChunks.readAll(f, builder);
-    }
+    executeWithInputStream(f -> {
+      for (ConsecutivePartList consecutiveChunks : allParts) {
+        consecutiveChunks.readAll(f, builder);
+      }
+    });
     for (Chunk chunk : builder.build()) {
       readChunkPages(chunk, block, currentRowGroup);
     }
@@ -1121,45 +1173,47 @@ public class ParquetFileReader implements Closeable {
       return null;
     }
 
-    // TODO: this should use getDictionaryPageOffset() but it isn't reliable.
-    if (f.getPos() != meta.getStartingPos()) {
-      f.seek(meta.getStartingPos());
-    }
-
-    boolean encryptedColumn = false;
-    InternalColumnDecryptionSetup columnDecryptionSetup = null;
-    byte[] dictionaryPageAAD = null;
-    BlockCipher.Decryptor pageDecryptor = null;
-    if (null != fileDecryptor  && !fileDecryptor.plaintextFile()) {
-      columnDecryptionSetup = fileDecryptor.getColumnSetup(meta.getPath());
-      if (columnDecryptionSetup.isEncrypted()) {
-        encryptedColumn = true;
+    return executeWithInputStreamWithReturn(f -> {
+      // TODO: this should use getDictionaryPageOffset() but it isn't reliable.
+      if (f.getPos() != meta.getStartingPos()) {
+        f.seek(meta.getStartingPos());
       }
-    }
 
-    PageHeader pageHeader;
-    if (!encryptedColumn) {
-      pageHeader = Util.readPageHeader(f);
-    } else {
-      byte[] dictionaryPageHeaderAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.DictionaryPageHeader,
+      boolean encryptedColumn = false;
+      InternalColumnDecryptionSetup columnDecryptionSetup = null;
+      byte[] dictionaryPageAAD = null;
+      BlockCipher.Decryptor pageDecryptor = null;
+      if (null != fileDecryptor  && !fileDecryptor.plaintextFile()) {
+        columnDecryptionSetup = fileDecryptor.getColumnSetup(meta.getPath());
+        if (columnDecryptionSetup.isEncrypted()) {
+          encryptedColumn = true;
+        }
+      }
+
+      PageHeader pageHeader;
+      if (!encryptedColumn) {
+        pageHeader = Util.readPageHeader(f);
+      } else {
+        byte[] dictionaryPageHeaderAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.DictionaryPageHeader,
           meta.getRowGroupOrdinal(), columnDecryptionSetup.getOrdinal(), -1);
-      pageHeader = Util.readPageHeader(f, columnDecryptionSetup.getMetaDataDecryptor(), dictionaryPageHeaderAAD);
-      dictionaryPageAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.DictionaryPage,
+        pageHeader = Util.readPageHeader(f, columnDecryptionSetup.getMetaDataDecryptor(), dictionaryPageHeaderAAD);
+        dictionaryPageAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.DictionaryPage,
           meta.getRowGroupOrdinal(), columnDecryptionSetup.getOrdinal(), -1);
-      pageDecryptor = columnDecryptionSetup.getDataDecryptor();
-    }
+        pageDecryptor = columnDecryptionSetup.getDataDecryptor();
+      }
 
-    if (!pageHeader.isSetDictionary_page_header()) {
-      return null; // TODO: should this complain?
-    }
+      if (!pageHeader.isSetDictionary_page_header()) {
+        return null; // TODO: should this complain?
+      }
 
-    DictionaryPage compressedPage = readCompressedDictionary(pageHeader, f, pageDecryptor, dictionaryPageAAD);
-    BytesInputDecompressor decompressor = options.getCodecFactory().getDecompressor(meta.getCodec());
+      DictionaryPage compressedPage = readCompressedDictionary(pageHeader, f, pageDecryptor, dictionaryPageAAD);
+      BytesInputDecompressor decompressor = options.getCodecFactory().getDecompressor(meta.getCodec());
 
-    return new DictionaryPage(
+      return new DictionaryPage(
         decompressor.decompress(compressedPage.getBytes(), compressedPage.getUncompressedSize()),
         compressedPage.getDictionarySize(),
         compressedPage.getEncoding());
+    });
   }
 
   private DictionaryPage readCompressedDictionary(
@@ -1201,55 +1255,57 @@ public class ParquetFileReader implements Closeable {
       return null;
     }
 
-    // Prepare to decrypt Bloom filter (for encrypted columns)
-    BlockCipher.Decryptor bloomFilterDecryptor = null;
-    byte[] bloomFilterHeaderAAD = null;
-    byte[] bloomFilterBitsetAAD = null;
-    if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
-      InternalColumnDecryptionSetup columnDecryptionSetup = fileDecryptor.getColumnSetup(meta.getPath());
-      if (columnDecryptionSetup.isEncrypted()) {
-        bloomFilterDecryptor = columnDecryptionSetup.getMetaDataDecryptor();
-        bloomFilterHeaderAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.BloomFilterHeader,
+    return executeWithInputStreamWithReturn(f -> {
+      // Prepare to decrypt Bloom filter (for encrypted columns)
+      BlockCipher.Decryptor bloomFilterDecryptor = null;
+      byte[] bloomFilterHeaderAAD = null;
+      byte[] bloomFilterBitsetAAD = null;
+      if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
+        InternalColumnDecryptionSetup columnDecryptionSetup = fileDecryptor.getColumnSetup(meta.getPath());
+        if (columnDecryptionSetup.isEncrypted()) {
+          bloomFilterDecryptor = columnDecryptionSetup.getMetaDataDecryptor();
+          bloomFilterHeaderAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.BloomFilterHeader,
             meta.getRowGroupOrdinal(), columnDecryptionSetup.getOrdinal(), -1);
-        bloomFilterBitsetAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.BloomFilterBitset,
+          bloomFilterBitsetAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.BloomFilterBitset,
             meta.getRowGroupOrdinal(), columnDecryptionSetup.getOrdinal(), -1);
+        }
       }
-    }
 
-    // Read Bloom filter data header.
-    f.seek(bloomFilterOffset);
-    BloomFilterHeader bloomFilterHeader;
-    try {
-      bloomFilterHeader = Util.readBloomFilterHeader(f, bloomFilterDecryptor, bloomFilterHeaderAAD);
-    } catch (IOException e) {
-      LOG.warn("read no bloom filter");
-      return null;
-    }
-
-    int numBytes = bloomFilterHeader.getNumBytes();
-    if (numBytes <= 0 || numBytes > BlockSplitBloomFilter.UPPER_BOUND_BYTES) {
-      LOG.warn("the read bloom filter size is wrong, size is {}", bloomFilterHeader.getNumBytes());
-      return null;
-    }
-
-    if (!bloomFilterHeader.getHash().isSetXXHASH() || !bloomFilterHeader.getAlgorithm().isSetBLOCK()
-      || !bloomFilterHeader.getCompression().isSetUNCOMPRESSED()) {
-      LOG.warn("the read bloom filter is not supported yet,  algorithm = {}, hash = {}, compression = {}",
-        bloomFilterHeader.getAlgorithm(), bloomFilterHeader.getHash(), bloomFilterHeader.getCompression());
-      return null;
-    }
-
-    byte[] bitset;
-    if (null == bloomFilterDecryptor) {
-      bitset = new byte[numBytes];
-      f.readFully(bitset);
-    } else {
-      bitset = bloomFilterDecryptor.decrypt(f, bloomFilterBitsetAAD);
-      if (bitset.length != numBytes) {
-        throw new ParquetCryptoRuntimeException("Wrong length of decrypted bloom filter bitset");
+      // Read Bloom filter data header.
+      f.seek(bloomFilterOffset);
+      BloomFilterHeader bloomFilterHeader;
+      try {
+        bloomFilterHeader = Util.readBloomFilterHeader(f, bloomFilterDecryptor, bloomFilterHeaderAAD);
+      } catch (IOException e) {
+        LOG.warn("read no bloom filter");
+        return null;
       }
-    }
-    return new BlockSplitBloomFilter(bitset);
+
+      int numBytes = bloomFilterHeader.getNumBytes();
+      if (numBytes <= 0 || numBytes > BlockSplitBloomFilter.UPPER_BOUND_BYTES) {
+        LOG.warn("the read bloom filter size is wrong, size is {}", bloomFilterHeader.getNumBytes());
+        return null;
+      }
+
+      if (!bloomFilterHeader.getHash().isSetXXHASH() || !bloomFilterHeader.getAlgorithm().isSetBLOCK()
+        || !bloomFilterHeader.getCompression().isSetUNCOMPRESSED()) {
+        LOG.warn("the read bloom filter is not supported yet,  algorithm = {}, hash = {}, compression = {}",
+          bloomFilterHeader.getAlgorithm(), bloomFilterHeader.getHash(), bloomFilterHeader.getCompression());
+        return null;
+      }
+
+      byte[] bitset;
+      if (null == bloomFilterDecryptor) {
+        bitset = new byte[numBytes];
+        f.readFully(bitset);
+      } else {
+        bitset = bloomFilterDecryptor.decrypt(f, bloomFilterBitsetAAD);
+        if (bitset.length != numBytes) {
+          throw new ParquetCryptoRuntimeException("Wrong length of decrypted bloom filter bitset");
+        }
+      }
+      return new BlockSplitBloomFilter(bitset);
+    });
   }
 
   /**
@@ -1265,20 +1321,22 @@ public class ParquetFileReader implements Closeable {
     if (ref == null) {
       return null;
     }
-    f.seek(ref.getOffset());
+    return executeWithInputStreamWithReturn(f -> {
+      f.seek(ref.getOffset());
 
-    BlockCipher.Decryptor columnIndexDecryptor = null;
-    byte[] columnIndexAAD = null;
-    if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
-      InternalColumnDecryptionSetup columnDecryptionSetup = fileDecryptor.getColumnSetup(column.getPath());
-      if (columnDecryptionSetup.isEncrypted()) {
-        columnIndexDecryptor = columnDecryptionSetup.getMetaDataDecryptor();
-        columnIndexAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.ColumnIndex,
+      BlockCipher.Decryptor columnIndexDecryptor = null;
+      byte[] columnIndexAAD = null;
+      if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
+        InternalColumnDecryptionSetup columnDecryptionSetup = fileDecryptor.getColumnSetup(column.getPath());
+        if (columnDecryptionSetup.isEncrypted()) {
+          columnIndexDecryptor = columnDecryptionSetup.getMetaDataDecryptor();
+          columnIndexAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.ColumnIndex,
             column.getRowGroupOrdinal(), columnDecryptionSetup.getOrdinal(), -1);
+        }
       }
-    }
-    return ParquetMetadataConverter.fromParquetColumnIndex(column.getPrimitiveType(),
-        Util.readColumnIndex(f, columnIndexDecryptor, columnIndexAAD));
+      org.apache.parquet.format.ColumnIndex columnIndex = Util.readColumnIndex(f, columnIndexDecryptor, columnIndexAAD);
+      return ParquetMetadataConverter.fromParquetColumnIndex(column.getPrimitiveType(), columnIndex);
+    });
   }
 
   /**
@@ -1294,26 +1352,39 @@ public class ParquetFileReader implements Closeable {
     if (ref == null) {
       return null;
     }
-    f.seek(ref.getOffset());
+    return executeWithInputStreamWithReturn(f -> {
+      f.seek(ref.getOffset());
 
-    BlockCipher.Decryptor offsetIndexDecryptor = null;
-    byte[] offsetIndexAAD = null;
-    if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
-      InternalColumnDecryptionSetup columnDecryptionSetup = fileDecryptor.getColumnSetup(column.getPath());
-      if (columnDecryptionSetup.isEncrypted()) {
-        offsetIndexDecryptor = columnDecryptionSetup.getMetaDataDecryptor();
-        offsetIndexAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.OffsetIndex,
+      BlockCipher.Decryptor offsetIndexDecryptor = null;
+      byte[] offsetIndexAAD = null;
+      if (null != fileDecryptor && !fileDecryptor.plaintextFile()) {
+        InternalColumnDecryptionSetup columnDecryptionSetup = fileDecryptor.getColumnSetup(column.getPath());
+        if (columnDecryptionSetup.isEncrypted()) {
+          offsetIndexDecryptor = columnDecryptionSetup.getMetaDataDecryptor();
+          offsetIndexAAD = AesCipher.createModuleAAD(fileDecryptor.getFileAAD(), ModuleType.OffsetIndex,
             column.getRowGroupOrdinal(), columnDecryptionSetup.getOrdinal(), -1);
+        }
       }
-    }
-    return ParquetMetadataConverter.fromParquetOffsetIndex(Util.readOffsetIndex(f, offsetIndexDecryptor, offsetIndexAAD));
+      org.apache.parquet.format.OffsetIndex offsetIndex = Util.readOffsetIndex(f, offsetIndexDecryptor, offsetIndexAAD);
+      return ParquetMetadataConverter.fromParquetOffsetIndex(offsetIndex);
+    });
   }
 
   @Override
   public void close() throws IOException {
     try {
-      if (f != null) {
-        f.close();
+      List<IOException> exceptions = new ArrayList<>();
+      for (SeekableInputStream inputStream : inputStreamPool) {
+        try {
+          inputStream.close();
+        } catch (IOException e) {
+          exceptions.add(e);
+        }
+      }
+      if (exceptions.size() != 0) {
+        throw new IOException(String.format(
+          "Error closing SeekableInputStream, showing only the first exception of %d exceptions.", exceptions.size()),
+          exceptions.get(0));
       }
     } finally {
       options.getCodecFactory().release();

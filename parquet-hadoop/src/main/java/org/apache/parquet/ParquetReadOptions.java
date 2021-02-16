@@ -58,6 +58,7 @@ public class ParquetReadOptions {
   private final ByteBufferAllocator allocator;
   private final int maxAllocationSize;
   private final Map<String, String> properties;
+  private final int inputStreamPoolSize;
   private final FileDecryptionProperties fileDecryptionProperties;
 
   ParquetReadOptions(boolean useSignedStringMinMax,
@@ -73,6 +74,7 @@ public class ParquetReadOptions {
                      ByteBufferAllocator allocator,
                      int maxAllocationSize,
                      Map<String, String> properties,
+                     int inputStreamPoolSize,
                      FileDecryptionProperties fileDecryptionProperties) {
     this.useSignedStringMinMax = useSignedStringMinMax;
     this.useStatsFilter = useStatsFilter;
@@ -87,6 +89,7 @@ public class ParquetReadOptions {
     this.allocator = allocator;
     this.maxAllocationSize = maxAllocationSize;
     this.properties = Collections.unmodifiableMap(properties);
+    this.inputStreamPoolSize = inputStreamPoolSize;
     this.fileDecryptionProperties = fileDecryptionProperties;
   }
 
@@ -156,6 +159,10 @@ public class ParquetReadOptions {
         : defaultValue;
   }
 
+  public int getInputStreamPoolSize() {
+    return inputStreamPoolSize;
+  }
+
   public static Builder builder() {
     return new Builder();
   }
@@ -175,6 +182,7 @@ public class ParquetReadOptions {
     protected ByteBufferAllocator allocator = new HeapByteBufferAllocator();
     protected int maxAllocationSize = ALLOCATION_SIZE_DEFAULT;
     protected Map<String, String> properties = new HashMap<>();
+    protected int inputStreamPoolSize = 1;
     protected FileDecryptionProperties fileDecryptionProperties = null;
 
     public Builder useSignedStringMinMax(boolean useSignedStringMinMax) {
@@ -295,6 +303,10 @@ public class ParquetReadOptions {
       properties.put(key, value);
       return this;
     }
+    public Builder withInputStreamPoolSize(int inputStreamPoolSize) {
+      this.inputStreamPoolSize = inputStreamPoolSize;
+      return this;
+    }
 
     public Builder copy(ParquetReadOptions options) {
       useSignedStringMinMax(options.useSignedStringMinMax);
@@ -306,6 +318,7 @@ public class ParquetReadOptions {
       withCodecFactory(options.codecFactory);
       withAllocator(options.allocator);
       withPageChecksumVerification(options.usePageChecksumVerification);
+      withInputStreamPoolSize(options.inputStreamPoolSize);
       withDecryption(options.fileDecryptionProperties);
       for (Map.Entry<String, String> keyValue : options.properties.entrySet()) {
         set(keyValue.getKey(), keyValue.getValue());
@@ -317,7 +330,7 @@ public class ParquetReadOptions {
       return new ParquetReadOptions(
         useSignedStringMinMax, useStatsFilter, useDictionaryFilter, useRecordFilter,
         useColumnIndexFilter, usePageChecksumVerification, useBloomFilter, recordFilter, metadataFilter,
-        codecFactory, allocator, maxAllocationSize, properties, fileDecryptionProperties);
+        codecFactory, allocator, maxAllocationSize, properties, inputStreamPoolSize, fileDecryptionProperties);
     }
   }
 }
